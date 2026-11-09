@@ -4,11 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -19,20 +18,16 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
     private lateinit var log: TextView
     private lateinit var scroll: ScrollView
     private lateinit var input: EditText
+    private lateinit var jarvisBtn: Button
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
-    private val notes by lazy { File(filesDir, "notes.txt") }
-    private val countryCode = "91"   // used when a WhatsApp number has 10 digits
-    private val notePrefixes = listOf("take a note ", "add note ", "note ", "remember ", "write down ")
+    private val brain by lazy { Assistant(this) { say(it) } }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -44,10 +39,12 @@ class MainActivity : Activity() {
         log = TextView(this).apply { textSize = 18f }
         scroll = ScrollView(this).apply { addView(log) }
         root.addView(scroll, LinearLayout.LayoutParams(m, 0, 1f))
+        jarvisBtn = Button(this).apply { textSize = 20f; setOnClickListener { toggleJarvis() } }
+        root.addView(jarvisBtn, LinearLayout.LayoutParams(m, (70 * d).toInt()))
         root.addView(Button(this).apply {
-            text = "Tap and speak"; textSize = 22f
+            text = "Tap and speak (one command)"; textSize = 20f
             setOnClickListener { startListening() }
-        }, LinearLayout.LayoutParams(m, (80 * d).toInt()))
+        }, LinearLayout.LayoutParams(m, (70 * d).toInt()))
         val row = LinearLayout(this)
         input = EditText(this).apply {
             hint = "Or type a command"; setSingleLine(); imeOptions = EditorInfo.IME_ACTION_SEND
@@ -57,7 +54,13 @@ class MainActivity : Activity() {
         row.addView(Button(this).apply { text = "Send"; setOnClickListener { submit() } })
         root.addView(row)
         setContentView(root)
-        say("Hello! Tap the button and speak, or type a command. Say help to see what I can do.")
+        say("Hello! Tap Start Jarvis to keep me listening in the background, or type a command. Say help to see what I can do.")
+    }
+
+    override fun onResume() { super.onResume(); updateJarvisButton() }
+
+    private fun updateJarvisButton() {
+        jarvisBtn.text = if (ListenService.running) "Stop Jarvis (listening)" else "Start Jarvis (background)"
     }
 
     private fun show(t: String) { log.append(t + "\n\n"); scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) } }
@@ -66,16 +69,36 @@ class MainActivity : Activity() {
     private fun submit() {
         val t = input.text.toString().trim()
         input.setText("")
-        if (t.isNotEmpty()) handle(t)
+        if (t.isNotEmpty()) { show("You: $t"); brain.handle(t) }
+    }
+
+    private fun toggleJarvis() {
+        if (ListenService.running) {
+            stopService(Intent(this, ListenService::class.java))
+            jarvisBtn.text = "Start Jarvis (background)"
+            say("Jarvis stopped."); return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            val need = mutableListOf(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= 33) need.add(Manifest.permission.POST_NOTIFICATIONS)
+            requestPermissions(need.toTypedArray(), 2); return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            say("Please switch on Display over other apps for My Assistant. This lets me open apps while I run in the background. Then tap Start Jarvis again.")
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            return
+        }
+        startForegroundService(Intent(this, ListenService::class.java))
+        jarvisBtn.text = "Stop Jarvis (listening)"
+        say("Jarvis is online. Say Jarvis, then your command. You can leave this screen now.")
     }
 
     private fun startListening() {
+        if (ListenService.running) { say("Jarvis is already listening. Just say Jarvis and your command."); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            say("Speech recognition is not available on this device."); return
-        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) { say("Speech recognition is not available on this device."); return }
         recognizer?.destroy()
         val r = if (Build.VERSION.SDK_INT >= 33 && SpeechRecognizer.isOnDeviceRecognitionAvailable(this))
             SpeechRecognizer.createOnDeviceSpeechRecognizer(this) else SpeechRecognizer.createSpeechRecognizer(this)
@@ -100,7 +123,7 @@ class MainActivity : Activity() {
             override fun onResults(res: Bundle?) {
                 input.setText("")
                 val t = res?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (t.isNullOrBlank()) say("I did not catch that.") else handle(t)
+                if (t.isNullOrBlank()) say("I did not catch that.") else { show("You: $t"); brain.handle(t) }
             }
         })
         r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -111,85 +134,10 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(code, perms, res)
-        if (res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) startListening()
-        else say("I need the microphone permission to hear you. You can still type commands.")
-    }
-
-    private fun handle(raw: String) {
-        show("You: $raw")
-        val t = raw.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9 .+*/-]"), " ").replace(Regex(" +"), " ").trim()
-        val math = Regex("^(?:what is |whats |calculate )?(\\d+(?:\\.\\d+)?) (plus|minus|times|x|multiplied by|divided by|\\+|-|\\*|/) (\\d+(?:\\.\\d+)?)$").find(t)
-        val wa = Regex("^(?:send )?whatsapp (?:to )?((?:\\d ?){10,13})(.*)$").find(t)
-        when {
-            math != null -> {
-                val g = math.groupValues
-                val a = g[1].toDouble(); val c = g[3].toDouble()
-                val r: Double? = when (g[2]) {
-                    "plus", "+" -> a + c
-                    "minus", "-" -> a - c
-                    "divided by", "/" -> if (c == 0.0) null else a / c
-                    else -> a * c
-                }
-                say(if (r == null) "I cannot divide by zero." else "The answer is " +
-                    (if (r % 1.0 == 0.0) r.toLong().toString() else String.format("%.4f", r).trimEnd('0').trimEnd('.')))
-            }
-            t == "help" -> say("You can say: open WhatsApp. Note buy milk. Show notes. Clear notes. What time is it. Flashlight on. 245 times 12. Search for weather. WhatsApp 9876543210 hello.")
-            wa != null -> {
-                var num = wa.groupValues[1].replace(" ", "")
-                if (num.length == 10) num = countryCode + num
-                val msg = wa.groupValues[2].trim()
-                val url = "https://wa.me/$num" + if (msg.isNotEmpty()) "?text=" + Uri.encode(msg) else ""
-                say("Opening WhatsApp. Tap the send arrow to send.")
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-            }
-            t.startsWith("open ") -> openApp(t.substring(5))
-            t.startsWith("clear notes") || t.startsWith("delete notes") -> { notes.delete(); say("All notes deleted.") }
-            notePrefixes.any { t.startsWith(it) } -> saveNote(t.removePrefix(notePrefixes.first { t.startsWith(it) }))
-            t.contains("notes") || t == "note" -> showNotes()
-            t.contains("flashlight") || t.contains("torch") -> torch(!t.contains("off"))
-            t.contains("time") || t.contains("date") -> say(SimpleDateFormat("hh:mm a, EEEE d MMMM", Locale.getDefault()).format(Date()))
-            t.startsWith("search ") -> {
-                val q = t.removePrefix("search for ").removePrefix("search ")
-                say("Searching for $q")
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))))
-            }
-            else -> say("I did not understand that. Say help to hear what I can do.")
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            say("I need the microphone permission to hear you. You can still type commands."); return
         }
-    }
-
-    private fun openApp(name: String) {
-        val pm = packageManager
-        val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
-        val apps = list.map { it.loadLabel(pm).toString().lowercase() to it.activityInfo.packageName }
-        val n = name.replace(" ", "")
-        val hit = apps.firstOrNull { it.first.replace(" ", "") == n }
-            ?: apps.firstOrNull { it.first.replace(" ", "").contains(n) }
-            ?: apps.firstOrNull { it.first.length > 2 && n.contains(it.first.replace(" ", "")) }
-        val intent = hit?.let { pm.getLaunchIntentForPackage(it.second) }
-        if (hit == null || intent == null) { say("I could not find an app called $name."); return }
-        say("Opening ${hit.first}")
-        startActivity(intent)
-    }
-
-    private fun saveNote(t: String) {
-        if (t.isBlank()) { say("What should I note?"); return }
-        notes.appendText(SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date()) + " - " + t + "\n")
-        say("Note saved.")
-    }
-
-    private fun showNotes() {
-        val l = if (notes.exists()) notes.readLines() else emptyList()
-        if (l.isEmpty()) say("You have no notes yet.") else say(l.takeLast(8).joinToString("\n"))
-    }
-
-    private fun torch(on: Boolean) {
-        try {
-            val cm = getSystemService(CAMERA_SERVICE) as CameraManager
-            val id = cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
-            if (id == null) { say("This device has no flashlight."); return }
-            cm.setTorchMode(id, on)
-            say(if (on) "Flashlight on." else "Flashlight off.")
-        } catch (e: Exception) { say("I could not use the flashlight.") }
+        if (code == 2) toggleJarvis() else startListening()
     }
 
     override fun onDestroy() {
