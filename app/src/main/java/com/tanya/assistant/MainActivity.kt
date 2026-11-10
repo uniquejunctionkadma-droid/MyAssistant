@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var jarvisBtn: Button
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
+    private var askedContacts = false
     private val brain by lazy { Assistant(this) { say(it) } }
 
     override fun onCreate(b: Bundle?) {
@@ -41,6 +42,13 @@ class MainActivity : Activity() {
         root.addView(scroll, LinearLayout.LayoutParams(m, 0, 1f))
         jarvisBtn = Button(this).apply { textSize = 20f; setOnClickListener { toggleJarvis() } }
         root.addView(jarvisBtn, LinearLayout.LayoutParams(m, (70 * d).toInt()))
+        root.addView(Button(this).apply {
+            text = "Enable screen control (tap, type, scroll)"; textSize = 18f
+            setOnClickListener {
+                say("Find Jarvis screen control in the list, switch it on, and tap Allow. If it is greyed out, open Jarvis in App info, tap the three dots, and choose Allow restricted settings.")
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        }, LinearLayout.LayoutParams(m, (60 * d).toInt()))
         root.addView(Button(this).apply {
             text = "Tap and speak (one command)"; textSize = 20f
             setOnClickListener { startListening() }
@@ -77,6 +85,11 @@ class MainActivity : Activity() {
             stopService(Intent(this, ListenService::class.java))
             jarvisBtn.text = "Start Jarvis (background)"
             say("Jarvis stopped."); return
+        }
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED && !askedContacts) {
+            askedContacts = true
+            say("Please allow Contacts, so I can find names when you ask me to send messages.")
+            requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 3); return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             val need = mutableListOf(Manifest.permission.RECORD_AUDIO)
@@ -134,6 +147,7 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(code, perms, res)
+        if (code == 3) { toggleJarvis(); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             say("I need the microphone permission to hear you. You can still type commands."); return
         }
